@@ -1,5 +1,5 @@
 /*
- *   Save The Bees 1.1.0
+ *   Save The Bees 1.1.1
  *
  *   This Arduino sketch is developed for the Wemos D1 mini board but should
  *   work on every ESP8266 based board with few modifications.
@@ -19,7 +19,6 @@
  *   Copyright Riccardo Marconcini (riccardo DOT marconcini AT relayr DOT de)
  *
  *   TODO: function to retrieve automatically flash size if possible
- *   TODO: show existing credentials in html page
  *   TODO: move tare to setup mode
  */
 
@@ -46,7 +45,7 @@
 ***************************************************************************************/
 
 // Software version
-#define stb "1.1.0"
+#define stb "1.1.1"
 
 //  MQTT Params
 #define MQTT_SERVER "mqtt.relayr.io"
@@ -120,7 +119,7 @@ uint16_t loadArray[4];
 uint16_t tareArray[4];
 uint16_t humidity, temperature, weight;
 uint16_t currentCycle;
-uint16_t currentRTCCycle;
+u_long currentRTCCycle;
 u_long unixTime;
 float humidity_tmp, temperature_tmp, weight_tmp;
 bool defaultMode;
@@ -171,6 +170,7 @@ void setup() {
         if (!defaultMode) {
                 Serial.println("Setup mode active");
                 setupServer();
+                EEPROM.end();
 
         } else {
                 Serial.println("Default mode active");
@@ -200,7 +200,6 @@ void setup() {
                 EEPROM.begin(FLASH_SIZE);
 
                 //  Read the cycle counters from EEPROM
-                EEPROM.begin(FLASH_SIZE);
                 currentCycle = EEPROMReadInt(PACKET_CYCLE_BYTE);
                 currentRTCCycle = EEPROMReadLong(RTC_CYCLE_BYTE);
 
@@ -429,6 +428,15 @@ void runServer() {
         parseClientRequest(request);
         wifiClient.flush();
 
+        //  Initialize the EEPROM
+        EEPROM.begin(FLASH_SIZE);
+        EEPROM.get(SSID_BYTE, SSID);
+        EEPROM.get(SSID_PWD_BYTE, SSID_password);
+        EEPROM.get(DEVICEID_BYTE, device_ID);
+        EEPROM.get(MQTT_PWD_BYTE, MQTT_password);
+        EEPROM.get(MQTT_CLIENTID_BYTE, MQTT_clientID);
+        EEPROM.end();
+
         // Return the response
         wifiClient.println("HTTP/1.1 200 OK");
         wifiClient.println("Content-Type: text/html");
@@ -474,8 +482,7 @@ void runServer() {
                 "type='password' class='input' name='MQTT_password' "
                 "placeholder='ABc1D23efg-h' value='" +
                 String(MQTT_password) + "'> <br><br> <b>MQTT Client ID:</b> <br> <input "
-                "type='password' class='input' "
-                "name='MQTT_clientID' "
+                "type='text' class='input' name='MQTT_clientID' "
                 "placeholder='TH6gI6HKjhjkhvfcFDNWw' value='" +
                 String(MQTT_clientID) +
                 "'> </div> </div> </div> <div class='hexagon-row even'> <div "
@@ -489,7 +496,7 @@ void runServer() {
 void parseClientRequest(String req) {
 
         //  Get the SSID, SSID password, device ID, MQTT password and client ID
-        uint16_t startIndex = req.indexOf("GET /?SSID=");
+        int16_t startIndex = req.indexOf("GET /?SSID=");
 
         //  First check if request contains 'SSID='
         if (startIndex != -1) {
@@ -497,29 +504,30 @@ void parseClientRequest(String req) {
                 //  If so parse/search for all the other credentials
                 //  Get the SSID
                 uint16_t endIndex = req.indexOf("&SSID_password=");
-                req.substring(startIndex + 11, endIndex).toCharArray(SSID, 60);
+                urldecode(req.substring(startIndex + 11, endIndex)).toCharArray(SSID, 60);
 
                 //  Get the password
                 startIndex = req.indexOf("&SSID_password=");
                 endIndex = req.indexOf("&device_ID=");
-                req.substring(startIndex + 15, endIndex).toCharArray(SSID_password, 60);
+                urldecode(req.substring(startIndex + 15, endIndex)).toCharArray(SSID_password, 60);
 
                 //  Get the device ID
                 startIndex = req.indexOf("&device_ID=");
                 endIndex = req.indexOf("&MQTT_password=");
-                req.substring(startIndex + 11, endIndex).toCharArray(device_ID, 60);
+                urldecode(req.substring(startIndex + 11, endIndex)).toCharArray(device_ID, 60);
 
                 //  Get the MQTT password
                 startIndex = req.indexOf("&MQTT_password=");
                 endIndex = req.indexOf("&MQTT_clientID=");
-                req.substring(startIndex + 15, endIndex).toCharArray(MQTT_password, 60);
+                urldecode(req.substring(startIndex + 15, endIndex)).toCharArray(MQTT_password, 60);
 
                 //  Get the mqtt client ID
                 startIndex = req.indexOf("&MQTT_clientID=");
                 endIndex = req.indexOf(" HTTP/");
-                req.substring(startIndex + 15, endIndex).toCharArray(MQTT_clientID, 60);
+                urldecode(req.substring(startIndex + 15, endIndex)).toCharArray(MQTT_clientID, 60);
 
-
+                //  Initialize the EEPROM
+                EEPROM.begin(FLASH_SIZE);
                 Serial.println("-----------------");
                 Serial.println(SSID);
                 Serial.println(SSID_password);
@@ -664,7 +672,7 @@ void publish(u_long tmp_unixTime, uint16_t tmp_temp, uint16_t tmp_hum,
 ***************************************************************************************/
 
 //  Write a Long into the EEPROM: write in the address byte and the next 3 ones
-void EEPROMWriteLong(uint8_t address, u_long value) {
+void EEPROMWriteLong(uint16_t address, u_long value) {
 
         byte four = (value & 0xFF);
         byte three = ((value >> 8) & 0xFF);
@@ -706,7 +714,7 @@ void EEPROMWriteInt(uint16_t address, uint16_t value) {
 
 //  Read a Integer from the EEPROM: read the address byte and the next one
 //  returning the value
-u_long EEPROMReadInt(uint16_t address) {
+uint16_t EEPROMReadInt(uint16_t address) {
         uint16_t two = EEPROM.read(address);
         uint16_t one = EEPROM.read(address + 1);
         return ((two << 0) & 0xFF) + ((one << 8) & 0xFFFF);
@@ -896,7 +904,7 @@ void callback(char *topic, byte *payload, uint16_t length) {
         //  Store the received payload and convert it to string
         char p[length + 1];
         memcpy(p, payload, length);
-        p[length] = NULL;
+        p[length] = 0;
 
         //  Print the topic and the received payload
         Serial.println("topic: " + String(topic));
@@ -972,4 +980,55 @@ void mqtt_connect() {
                 Serial.println("Retrying in 5 seconds...");
                 delay(5000);
         }
+}
+
+
+
+/***************************************************************************************
+**  URL Functions                                                                     **
+***************************************************************************************/
+
+String urldecode(String str)
+{
+
+    String encodedString="";
+    char c;
+    char code0;
+    char code1;
+    for (int i =0; i < str.length(); i++){
+        c=str.charAt(i);
+      if (c == '+'){
+        encodedString+=' ';
+      }else if (c == '%') {
+        i++;
+        code0=str.charAt(i);
+        i++;
+        code1=str.charAt(i);
+        c = (h2int(code0) << 4) | h2int(code1);
+        encodedString+=c;
+      } else{
+
+        encodedString+=c;
+      }
+
+      yield();
+    }
+
+   return encodedString;
+}
+
+
+
+unsigned char h2int(char c)
+{
+    if (c >= '0' && c <='9'){
+        return((unsigned char)c - '0');
+    }
+    if (c >= 'a' && c <='f'){
+        return((unsigned char)c - 'a' + 10);
+    }
+    if (c >= 'A' && c <='F'){
+        return((unsigned char)c - 'A' + 10);
+    }
+    return(0);
 }
