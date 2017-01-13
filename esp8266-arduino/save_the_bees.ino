@@ -1,5 +1,5 @@
 /*
- *   Save The Bees 1.1.1
+ *   Save The Bees 1.1.2
  *
  *   This Arduino sketch is developed for the Wemos D1 mini board but should
  *   work on every ESP8266 based board with few modifications.
@@ -8,18 +8,20 @@
  *   - Setup Mode: the board works as an access point and the user can enter the
  *                 WiFi and relayr credentials to be used in default mode;
  *   - Default Mode: the board wakes up from deep sleep after SLEEP_TIME
- *                   seconds, it gets the readings from the sensors and the timestamp
- *                   from the RTC module and save them as a packet into the EEPROM.
- *                   When the board saved BULK_DIM packets, it connects to the relayr
- *                   cloud and send all of them. Then the cycle of readings starts
- *                   again.
+ *                   seconds, it gets the readings from the sensors and the
+ *                   timestamp
+ *                   from the RTC module and save them as a packet into the
+ *                   EEPROM.
+ *                   When the board saved BULK_DIM packets, it connects to the
+ *                   relayr cloud and send all of them. Then the cycle of readings
+ *                   starts again.
  *
- *   Last Edit: 10 Jan 2016 18.20 CET
+ *   Last Edit: 13 Jan 2016 20.52 CET
  *
  *   Copyright Riccardo Marconcini (riccardo DOT marconcini AT relayr DOT de)
  *
  *   TODO: function to retrieve automatically flash size if possible
- *   TODO: move tare to setup mode
+ *   TODO: add commands/config/qos
  */
 
 
@@ -45,7 +47,7 @@
 ***************************************************************************************/
 
 // Software version
-#define stb "1.1.1"
+#define stb "1.1.2"
 
 //  MQTT Params
 #define MQTT_SERVER "mqtt.relayr.io"
@@ -67,15 +69,16 @@
 #define RTC_CYCLE_BYTE 318
 
 //  Map of the EEPROM packet bytes
-#define TIMESTAMP_BYTE 320  //  Number of the first  timestamp byte in 1st packet
-#define TEMP_BYTE 324       //  Number of the first temperature byte in 1st packet
-#define HUM_BYTE 326        //  Number of the first humidity byte in 1st packet
-#define WEIGHT_BYTE 328     //  Number of the first weight byte in 1st packet
+#define TIMESTAMP_BYTE 320 //  Number of the first  timestamp byte in 1st packet
+#define TEMP_BYTE 324   //  Number of the first temperature byte in 1st packet
+#define HUM_BYTE 326    //  Number of the first humidity byte in 1st packet
+#define WEIGHT_BYTE 328 //  Number of the first weight byte in 1st packet
 
 //  Deep Sleep Time in seconds
 #define SLEEP_TIME 60
 
-//  RTC will sync to NTP at the first connection after reached this cycle iteration
+//  RTC will sync to NTP at the first connection after reached this cycle
+//  iteration
 #define RTC_CYCLE 10080
 
 //  Size of flash memory
@@ -101,6 +104,9 @@
 #define AM_SDA D4
 #define AM_SCL D3
 
+//  Calibration fract
+#define CALIBRATION_FRACT 42
+
 
 
 /***************************************************************************************
@@ -110,7 +116,7 @@
 WiFiServer server(WEB_SERVER_PORT);
 WiFiClient espClient;
 PubSubClient pubSubClient(espClient);
-RTC_DS1307 rtc;
+RTC_DS1307 rtc; //  or RTC_DS3231
 Adafruit_AM2315 am2315;
 WiFiUDP udp;
 uint16_t lastPublishTime;
@@ -123,6 +129,7 @@ u_long currentRTCCycle;
 u_long unixTime;
 float humidity_tmp, temperature_tmp, weight_tmp;
 bool defaultMode;
+bool tareMode;
 char SSID[60];
 char SSID_password[60];
 char device_ID[60];
@@ -142,7 +149,8 @@ void setupServer();
 void runServer();
 void parseClientRequest(String req);
 void publish_packet(uint16_t packet_number);
-void publish(u_long tmp_unixTime, uint16_t tmp_temp, uint16_t tmp_hum, uint16_t tmp_weight);
+void publish(u_long tmp_unixTime, uint16_t tmp_temp, uint16_t tmp_hum,
+             uint16_t tmp_weight);
 
 
 
@@ -159,10 +167,18 @@ void setup() {
         pinMode(TAREPIN, INPUT);
         pinMode(MODEPIN, INPUT);
 
+        //  Initialize the EEPROM
+        EEPROM.begin(FLASH_SIZE);
+
         //  Initialize the serial output
         Serial.begin(9600);
         Serial.println("\n\n");
         Serial.println("*** Save The Bees " + String(stb) + " ***");
+
+        EEPROM.get(TARE_BYTE, tareArray);
+        Serial.println("TARE: " + String(tareArray[0]) + " " +
+                       String(tareArray[1]) + " " + String(tareArray[2]) + " " +
+                       String(tareArray[3]));
 
         // Check in which mode is the board
         defaultMode = digitalRead(MODEPIN);
@@ -195,9 +211,6 @@ void setup() {
                 //  Force the WiFi off to avoid troubles with wifi after woke up from deep
                 //  sleep with a I2C device connected
                 WiFi.mode(WIFI_OFF);
-
-                //  Initialize the EEPROM
-                EEPROM.begin(FLASH_SIZE);
 
                 //  Read the cycle counters from EEPROM
                 currentCycle = EEPROMReadInt(PACKET_CYCLE_BYTE);
@@ -388,14 +401,12 @@ void setupServer() {
         WiFi.mode(WIFI_AP);
 
         Serial.print("Setting WEMOS as Soft Access Point... ");
-        boolean result = WiFi.softAP(ACCESS_POINT_SSID,
-                                     ACCESS_POINT_PWD,
-                                     ACCESS_POINT_CHANNEL,
-                                     ACCESS_POINT_HIDDEN);
-           if (result == true)
-           Serial.println("Done");
-           else
-           Serial.println("Failed!");
+        boolean result = WiFi.softAP(ACCESS_POINT_SSID, ACCESS_POINT_PWD,
+                                     ACCESS_POINT_CHANNEL, ACCESS_POINT_HIDDEN);
+        if (result == true)
+                Serial.println("Done");
+        else
+                Serial.println("Failed!");
 
         //  Start the server
         server.begin();
@@ -409,7 +420,8 @@ void setupServer() {
 
 
 
-//  Function that sends and HTTP answer to a client (browser) that connects to web server
+//  Function that sends and HTTP answer to a client (browser) that connects to
+//  web server
 void runServer() {
 
         //  Check if a client (browser) has connected
@@ -428,68 +440,135 @@ void runServer() {
         parseClientRequest(request);
         wifiClient.flush();
 
-        //  Initialize the EEPROM
-        EEPROM.begin(FLASH_SIZE);
-        EEPROM.get(SSID_BYTE, SSID);
-        EEPROM.get(SSID_PWD_BYTE, SSID_password);
-        EEPROM.get(DEVICEID_BYTE, device_ID);
-        EEPROM.get(MQTT_PWD_BYTE, MQTT_password);
-        EEPROM.get(MQTT_CLIENTID_BYTE, MQTT_clientID);
-        EEPROM.end();
+        if (tareMode) {
+                //  Initialize the EEPROM
+                EEPROM.begin(FLASH_SIZE);
+                EEPROM.get(TARE_BYTE, tareArray);
+                EEPROM.end();
 
-        // Return the response
-        wifiClient.println("HTTP/1.1 200 OK");
-        wifiClient.println("Content-Type: text/html");
-        wifiClient.println("");
-        wifiClient.println(
-                "<!DOCTYPE html><html><head> <title>Save The Bees</title> <style>body { "
-                "background: #003056; font-family: Helvetica, Arial, sans-serif; color: "
-                "#2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; "
-                "border-bottom: 120px solid #e49436; border-left: 208px solid "
-                "transparent; border-right: 208px solid transparent; position: absolute; "
-                "top: -120px}.hexagon { width: 416px; height: 280px; margin-top: 124px; "
-                "margin-left: 3px; background-color: #e49436; position: relative; float: "
-                "left}.hexagon:after { content: ''; width: 0; position: absolute; "
-                "bottom: -120px; border-top: 120px solid #e49436; border-left: 208px "
-                "solid transparent; border-right: 208px solid transparent}.hexagon-row { "
-                "clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { width: "
-                "370px; text-align: center; position: absolute; top: 50%; left: 50%; "
-                "transform: translate(-50%, -50%)}.input { color: #3c3c3c; font-family: "
-                "Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; "
-                "border-radius: 4px; line-height: 22px; background-color: #E1E1E1; "
-                "padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; box-sizing: "
-                "border-box; border: 3px solid #E1E1E1}.input:focus { background: "
-                "#E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; "
-                "outline: none; padding: 5px 5px 5px 5px;}#button { font-family: "
-                "Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; "
-                "background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; "
-                "font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: "
-                "all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { "
-                "background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid "
-                "3px}</style></head><body> <form id='credentialsForm' action=''> <div "
-                "class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> "
-                "<h1>Wifi Credentials</h1> <b>Wifi SSID:</b> <br> <input type='text' "
-                "class='input' name='SSID' placeholder='SSID name' value='" +
-                String(SSID) + "'> <br><br> <b>Wifi Password:</b> <br> <input "
-                "type='password' class='input' name='SSID_password' "
-                "placeholder='SSID password' value='" +
-                String(SSID_password) +
-                "'> </div> </div> <div class='hexagon'> <div class='hexagonIn'> "
-                "<h1>relayr Credentials</h1> <b>DeviceID:</b> <br> <input type='text' "
-                "class='input' name='device_ID' "
-                "placeholder='12345678-1234-1234-1234-0123456789ab' value='" +
-                String(device_ID) + "'> <br><br> <b>MQTT Password:</b> <br> <input "
-                "type='password' class='input' name='MQTT_password' "
-                "placeholder='ABc1D23efg-h' value='" +
-                String(MQTT_password) + "'> <br><br> <b>MQTT Client ID:</b> <br> <input "
-                "type='text' class='input' name='MQTT_clientID' "
-                "placeholder='TH6gI6HKjhjkhvfcFDNWw' value='" +
-                String(MQTT_clientID) +
-                "'> </div> </div> </div> <div class='hexagon-row even'> <div "
-                "class='hexagon'> <div class='hexagonIn'> <input type='submit' "
-                "id='button' value='Save'> </div> </div> </div> </form></body></html>");
-        delay(1);
+                // Return the response
+                wifiClient.println("HTTP/1.1 200 OK");
+                wifiClient.println("Content-Type: text/html");
+                wifiClient.println("");
+                wifiClient.println(
+                        "<!DOCTYPE html><html><head> <title>Tare</title> <style>body { "
+                        "background: #003056; font-family: Helvetica, Arial, sans-serif; "
+                        "color: #2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; "
+                        "border-bottom: 120px solid #e49436; border-left: 208px solid "
+                        "transparent; border-right: 208px solid transparent; position: "
+                        "absolute; top: -120px}.hexagon { width: 416px; height: 240px; "
+                        "margin-top: 124px; margin-left: 3px; background-color: #e49436; "
+                        "position: relative; float: left}.hexagon:after { content: ''; width: "
+                        "0; position: absolute; bottom: -120px; border-top: 120px solid "
+                        "#e49436; border-left: 208px solid transparent; border-right: 208px "
+                        "solid transparent}.hexagon-row { clear: left}.hexagon-row.even { "
+                        "margin-left: 209px}.hexagonIn { width: 370px; text-align: center; "
+                        "position: absolute; top: 50%; left: 50%; transform: translate(-50%, "
+                        "-50%)}.input { color: #3c3c3c; font-family: Helvetica, Arial, "
+                        "sans-serif; font-weight: 500; font-size: 18px; border-radius: 4px; "
+                        "line-height: 22px; background-color: #E1E1E1; padding: 5px 5px 5px "
+                        "5px; margin-bottom: 5px; width: 100%; box-sizing: border-box; border: "
+                        "3px solid #E1E1E1}.input:focus { background: #E1E1E1; box-shadow: 0; "
+                        "border: 3px solid #003056; color: #003056; outline: none; padding: "
+                        "5px 5px 5px 5px;}#button { font-family: Helvetica, sans-serif; float: "
+                        "left; width: 100%; cursor: pointer; background-color: #E1E1E1; color: "
+                        "#003056; border: #003056 solid 3px; font-size: 24px; padding-top: "
+                        "22px; padding-bottom: 22px; transition: all 0.3s; margin-top: 0px; "
+                        "border-radius: 4px}#button:hover { background-color: #003056; color: "
+                        "#E1E1E1; border: #E1E1E1 solid 3px}</style></head><body> <form "
+                        "id='tareForm' action='/tareset'> <div class='hexagon-row'> <div "
+                        "class='hexagon'> <div class='hexagonIn'> <h1> <b>Tare cell "
+                        "1</b><br><b>" +
+                        String(tareArray[0]) + " kg</b> <br><br> <b>Tare cell 2</b><br><b>" +
+                        String(tareArray[1]) + " kg</b> </h1> </div> </div> <div "
+                        "class='hexagon'> <div class='hexagonIn'> <h1> "
+                        "<b>Tare cell 3</b><br><b>" +
+                        String(tareArray[2]) + " kg</b> <br><br> <b>Tare cell 4</b><br><b>" +
+                        String(tareArray[3]) + " kg</b> </h1> </div> </div> </div> <div" +
+                        "class='hexagon-row even'> "
+                        "<div class='hexagon'> <div class='hexagonIn'> <input type='submit' "
+                        "id='button' value='Set New Tare'> </div> </div> </div> "
+                        "</form></body></html>");
+
+                delay(1);
+        }
+
+        else {
+                //  Initialize the EEPROM
+                EEPROM.begin(FLASH_SIZE);
+                EEPROM.get(SSID_BYTE, SSID);
+                EEPROM.get(SSID_PWD_BYTE, SSID_password);
+                EEPROM.get(DEVICEID_BYTE, device_ID);
+                EEPROM.get(MQTT_PWD_BYTE, MQTT_password);
+                EEPROM.get(MQTT_CLIENTID_BYTE, MQTT_clientID);
+                EEPROM.end();
+
+                // Return the response
+                wifiClient.println("HTTP/1.1 200 OK");
+                wifiClient.println("Content-Type: text/html");
+                wifiClient.println("");
+                wifiClient.println(
+                        "<!DOCTYPE html><html><head> <title>Save The Bees</title> <style>body "
+                        "{ "
+                        "background: #003056; font-family: Helvetica, Arial, sans-serif; "
+                        "color: "
+                        "#2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; "
+                        "border-bottom: 120px solid #e49436; border-left: 208px solid "
+                        "transparent; border-right: 208px solid transparent; position: "
+                        "absolute; "
+                        "top: -120px}.hexagon { width: 416px; height: 280px; margin-top: "
+                        "124px; "
+                        "margin-left: 3px; background-color: #e49436; position: relative; "
+                        "float: "
+                        "left}.hexagon:after { content: ''; width: 0; position: absolute; "
+                        "bottom: -120px; border-top: 120px solid #e49436; border-left: 208px "
+                        "solid transparent; border-right: 208px solid transparent}.hexagon-row "
+                        "{ "
+                        "clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { "
+                        "width: "
+                        "370px; text-align: center; position: absolute; top: 50%; left: 50%; "
+                        "transform: translate(-50%, -50%)}.input { color: #3c3c3c; "
+                        "font-family: "
+                        "Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; "
+                        "border-radius: 4px; line-height: 22px; background-color: #E1E1E1; "
+                        "padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; "
+                        "box-sizing: "
+                        "border-box; border: 3px solid #E1E1E1}.input:focus { background: "
+                        "#E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; "
+                        "outline: none; padding: 5px 5px 5px 5px;}#button { font-family: "
+                        "Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; "
+                        "background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; "
+                        "font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: "
+                        "all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { "
+                        "background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid "
+                        "3px}</style></head><body> <form id='credentialsForm' action=''> <div "
+                        "class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> "
+                        "<h1>Wifi Credentials</h1> <b>Wifi SSID:</b> <br> <input type='text' "
+                        "class='input' name='SSID' placeholder='SSID name' value='" +
+                        String(SSID) + "'> <br><br> <b>Wifi Password:</b> <br> <input "
+                        "type='password' class='input' name='SSID_password' "
+                        "placeholder='SSID password value='" +
+                        String(SSID_password) +
+                        "'> </div> </div> <div class='hexagon'> <div class='hexagonIn'> "
+                        "<h1>relayr Credentials</h1> <b>DeviceID:</b> <br> <input type='text' "
+                        "class='input' name='device_ID' "
+                        "placeholder='12345678-1234-1234-1234-0123456789ab' value='" +
+                        String(device_ID) +
+                        "'> <br><br> <b>MQTT Password:</b> <br> <input "
+                        "type='password' class='input' name='MQTT_password' "
+                        "placeholder='ABc1D23efg-h' value='" +
+                        String(MQTT_password) +
+                        "'> <br><br> <b>MQTT Client ID:</b> <br> <input "
+                        "type='text' class='input' name='MQTT_clientID' "
+                        "placeholder='TH6gI6HKjhjkhvfcFDNWw' value='" +
+                        String(MQTT_clientID) +
+                        "'> </div> </div> </div> <div class='hexagon-row even'> <div "
+                        "class='hexagon'> <div class='hexagonIn'> <input type='submit' "
+                        "id='button' value='Save'> </div> </div> </div> </form></body></html>");
+                delay(1);
+        }
 }
+
 
 
 //  Function to parse the HTTP get request from client contining the credentials
@@ -501,6 +580,8 @@ void parseClientRequest(String req) {
         //  First check if request contains 'SSID='
         if (startIndex != -1) {
 
+                tareMode = false;
+
                 //  If so parse/search for all the other credentials
                 //  Get the SSID
                 uint16_t endIndex = req.indexOf("&SSID_password=");
@@ -509,22 +590,26 @@ void parseClientRequest(String req) {
                 //  Get the password
                 startIndex = req.indexOf("&SSID_password=");
                 endIndex = req.indexOf("&device_ID=");
-                urldecode(req.substring(startIndex + 15, endIndex)).toCharArray(SSID_password, 60);
+                urldecode(req.substring(startIndex + 15, endIndex))
+                .toCharArray(SSID_password, 60);
 
                 //  Get the device ID
                 startIndex = req.indexOf("&device_ID=");
                 endIndex = req.indexOf("&MQTT_password=");
-                urldecode(req.substring(startIndex + 11, endIndex)).toCharArray(device_ID, 60);
+                urldecode(req.substring(startIndex + 11, endIndex))
+                .toCharArray(device_ID, 60);
 
                 //  Get the MQTT password
                 startIndex = req.indexOf("&MQTT_password=");
                 endIndex = req.indexOf("&MQTT_clientID=");
-                urldecode(req.substring(startIndex + 15, endIndex)).toCharArray(MQTT_password, 60);
+                urldecode(req.substring(startIndex + 15, endIndex))
+                .toCharArray(MQTT_password, 60);
 
                 //  Get the mqtt client ID
                 startIndex = req.indexOf("&MQTT_clientID=");
                 endIndex = req.indexOf(" HTTP/");
-                urldecode(req.substring(startIndex + 15, endIndex)).toCharArray(MQTT_clientID, 60);
+                urldecode(req.substring(startIndex + 15, endIndex))
+                .toCharArray(MQTT_clientID, 60);
 
                 //  Initialize the EEPROM
                 EEPROM.begin(FLASH_SIZE);
@@ -544,6 +629,19 @@ void parseClientRequest(String req) {
                 EEPROM.put(MQTT_CLIENTID_BYTE, MQTT_clientID);
                 EEPROM.end();
         }
+
+        startIndex = req.indexOf("GET /tareset");
+        if (startIndex != -1) {
+                tareMode = true;
+                setTare();
+        }
+
+        startIndex = req.indexOf("GET /tare");
+        if (startIndex != -1) {
+                tareMode = true;
+        } else
+                tareMode = false;
+
 }
 
 
@@ -571,8 +669,10 @@ void publish_packet(uint16_t packet_number) {
                         //  Get the readings and timestamp of the packet number from EEPROM
                         u_long tmp_unixTime =
                                 EEPROMReadLong(TIMESTAMP_BYTE + (packet_number * PACKET_SIZE));
-                        uint16_t tmp_temp = EEPROMReadInt(TEMP_BYTE + (packet_number * PACKET_SIZE));
-                        uint16_t tmp_hum = EEPROMReadInt(HUM_BYTE + (packet_number * PACKET_SIZE));
+                        uint16_t tmp_temp =
+                                EEPROMReadInt(TEMP_BYTE + (packet_number * PACKET_SIZE));
+                        uint16_t tmp_hum =
+                                EEPROMReadInt(HUM_BYTE + (packet_number * PACKET_SIZE));
                         uint16_t tmp_weight =
                                 EEPROMReadInt(WEIGHT_BYTE + (packet_number * PACKET_SIZE));
 
@@ -602,9 +702,9 @@ void publish(u_long tmp_unixTime, uint16_t tmp_temp, uint16_t tmp_hum,
         StaticJsonBuffer<MQTT_MAX_PACKET_SIZE> pubJsonBuffer;
         JsonArray &root = pubJsonBuffer.createArray();
 
-        //  Timestamp of the readings needs to be specified in milliseconds in relayr cloud
-        //  but ESP8266 cannot handle 64bits types, so it is transformed into string adding
-        //  manually the millis
+        //  Timestamp of the readings needs to be specified in milliseconds in relayr
+        //  cloud but ESP8266 cannot handle 64bits types, so it is transformed into
+        //  string adding manually the millis
         String ut = (String(tmp_unixTime) + String("000"));
 
         //  First object: temperature
@@ -636,8 +736,9 @@ void publish(u_long tmp_unixTime, uint16_t tmp_temp, uint16_t tmp_hum,
         const char *ts = "\"ts\"";
         char *p = message_buff;
 
-        //  Scan all the string looking for "ts", everytime it has found, the following 5th
-        //  and 18th characters (wrapping the timestamp number) are removed
+        //  Scan all the string looking for "ts", everytime it has found, the
+        //  following 5th and 18th characters (wrapping the timestamp number)
+        //  are removed
         while ((p = strstr(p, ts)) != NULL) {
                 if (p) {
                         Serial.print("found [");
@@ -723,7 +824,7 @@ uint16_t EEPROMReadInt(uint16_t address) {
 
 
 /***************************************************************************************
-**  NTP Function (from http://playground.arduino.cc/Code/NTPclient)                   **
+**  NTP Function (from http://playground.arduino.cc/Code/NTPclient) **
 ***************************************************************************************/
 
 u_long ntpUnixTime(UDP &udp) {
@@ -886,7 +987,7 @@ void setTare() {
 //  Calibrate the analog input to kg
 float calibrate(float input) {
 
-        float output = (input) / 42;
+        float output = (input) / CALIBRATION_FRACT;
         if (input == 0)
                 output = 0;
 
@@ -988,47 +1089,42 @@ void mqtt_connect() {
 **  URL Functions                                                                     **
 ***************************************************************************************/
 
-String urldecode(String str)
-{
+String urldecode(String str) {
 
-    String encodedString="";
-    char c;
-    char code0;
-    char code1;
-    for (int i =0; i < str.length(); i++){
-        c=str.charAt(i);
-      if (c == '+'){
-        encodedString+=' ';
-      }else if (c == '%') {
-        i++;
-        code0=str.charAt(i);
-        i++;
-        code1=str.charAt(i);
-        c = (h2int(code0) << 4) | h2int(code1);
-        encodedString+=c;
-      } else{
-
-        encodedString+=c;
-      }
-
-      yield();
-    }
-
-   return encodedString;
+        String encodedString = "";
+        char c;
+        char code0;
+        char code1;
+        for (int i = 0; i < str.length(); i++) {
+                c = str.charAt(i);
+                if (c == '+') {
+                        encodedString += ' ';
+                } else if (c == '%') {
+                        i++;
+                        code0 = str.charAt(i);
+                        i++;
+                        code1 = str.charAt(i);
+                        c = (h2int(code0) << 4) | h2int(code1);
+                        encodedString += c;
+                } else {
+                        encodedString += c;
+                }
+                yield();
+        }
+        return encodedString;
 }
 
 
 
-unsigned char h2int(char c)
-{
-    if (c >= '0' && c <='9'){
-        return((unsigned char)c - '0');
-    }
-    if (c >= 'a' && c <='f'){
-        return((unsigned char)c - 'a' + 10);
-    }
-    if (c >= 'A' && c <='F'){
-        return((unsigned char)c - 'A' + 10);
-    }
-    return(0);
+unsigned char h2int(char c) {
+        if (c >= '0' && c <= '9') {
+                return ((unsigned char)c - '0');
+        }
+        if (c >= 'a' && c <= 'f') {
+                return ((unsigned char)c - 'a' + 10);
+        }
+        if (c >= 'A' && c <= 'F') {
+                return ((unsigned char)c - 'A' + 10);
+        }
+        return (0);
 }
