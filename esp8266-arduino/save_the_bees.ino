@@ -21,7 +21,6 @@
  *   Copyright Riccardo Marconcini (riccardo DOT marconcini AT relayr DOT de)
  *
  *   TODO: function to retrieve automatically flash size if possible
- *   TODO: add commands/config/qos
  */
 
 
@@ -65,14 +64,14 @@
 #define MQTT_PWD_BYTE 180
 #define MQTT_CLIENTID_BYTE 240
 #define TARE_BYTE 300
-#define PACKET_CYCLE_BYTE 316
-#define RTC_CYCLE_BYTE 318
+#define PACKET_CYCLE_BYTE 320
+#define RTC_CYCLE_BYTE 322
 
 //  Map of the EEPROM packet bytes
-#define TIMESTAMP_BYTE 320 //  Number of the first  timestamp byte in 1st packet
-#define TEMP_BYTE 324   //  Number of the first temperature byte in 1st packet
-#define HUM_BYTE 326    //  Number of the first humidity byte in 1st packet
-#define WEIGHT_BYTE 328 //  Number of the first weight byte in 1st packet
+#define TIMESTAMP_BYTE 324 //  Number of the first  timestamp byte in 1st packet
+#define TEMP_BYTE 328   //  Number of the first temperature byte in 1st packet
+#define HUM_BYTE 330    //  Number of the first humidity byte in 1st packet
+#define WEIGHT_BYTE 332 //  Number of the first weight byte in 1st packet
 
 //  Deep Sleep Time in seconds
 #define SLEEP_TIME 60
@@ -85,7 +84,7 @@
 #define FLASH_SIZE 4096
 
 //  Pin to change Operating Mode
-#define MODEPIN D5
+#define MODEPIN A0
 
 //  Wifi Credentials of Setup Mode
 #define WEB_SERVER_PORT 80
@@ -94,18 +93,14 @@
 #define ACCESS_POINT_CHANNEL 1
 #define ACCESS_POINT_HIDDEN false
 
-//  Pins for the Multiplexer & Loadcells
-#define LOADPIN A0
-#define TAREPIN D6
-#define S0 D8
-#define S1 D7
-
-//  Pins for AM2315
-#define AM_SDA D4
-#define AM_SCL D3
+//  Pins for the ADC & Loadcells
+#define SELPIN D8       //Selection Pin
+#define DATAOUT D7      //MOSI
+#define DATAIN  D6      //MISO
+#define SPICLOCK  D5    //Clock
 
 //  Calibration fract
-#define CALIBRATION_FRACT 42
+#define CALIBRATION_FRACT 68
 
 
 
@@ -116,19 +111,20 @@
 WiFiServer server(WEB_SERVER_PORT);
 WiFiClient espClient;
 PubSubClient pubSubClient(espClient);
-RTC_DS1307 rtc; //  or RTC_DS3231
+RTC_DS3231 rtc; //  or RTC_DS1307
 Adafruit_AM2315 am2315;
 WiFiUDP udp;
 uint16_t lastPublishTime;
 uint16_t publishingPeriod = 3000;
-uint16_t loadArray[4];
-uint16_t tareArray[4];
+uint16_t loadArray[5];
+uint16_t tareArray[5];
+uint16_t zeroArray[] {411, 403, 414, 465, 400};
 uint16_t humidity, temperature, weight;
 uint16_t currentCycle;
 u_long currentRTCCycle;
 u_long unixTime;
 float humidity_tmp, temperature_tmp, weight_tmp;
-bool defaultMode;
+bool setupMode;
 bool tareMode;
 char SSID[60];
 char SSID_password[60];
@@ -161,11 +157,15 @@ void publish(u_long tmp_unixTime, uint16_t tmp_temp, uint16_t tmp_hum,
 void setup() {
 
         //  Initialize the PINS
-        pinMode(S0, OUTPUT);
-        pinMode(S1, OUTPUT);
-        pinMode(LOADPIN, INPUT);
-        pinMode(TAREPIN, INPUT);
+        pinMode(SELPIN, OUTPUT);
+        pinMode(DATAOUT, OUTPUT);
+        pinMode(DATAIN, INPUT);
+        pinMode(SPICLOCK, OUTPUT);
         pinMode(MODEPIN, INPUT);
+
+        digitalWrite(SELPIN,HIGH);
+        digitalWrite(DATAOUT,LOW);
+        digitalWrite(SPICLOCK,LOW);
 
         //  Initialize the EEPROM
         EEPROM.begin(FLASH_SIZE);
@@ -178,12 +178,15 @@ void setup() {
         EEPROM.get(TARE_BYTE, tareArray);
         Serial.println("TARE: " + String(tareArray[0]) + " " +
                        String(tareArray[1]) + " " + String(tareArray[2]) + " " +
-                       String(tareArray[3]));
+                       String(tareArray[3]) + " " + String(tareArray[4]));
 
         // Check in which mode is the board
-        defaultMode = digitalRead(MODEPIN);
+        if (analogRead(MODEPIN) > 600)
+                setupMode = true;
+        else
+                setupMode = false;
 
-        if (!defaultMode) {
+        if (setupMode) {
                 Serial.println("Setup mode active");
                 setupServer();
                 EEPROM.end();
@@ -347,7 +350,7 @@ void setup() {
 
 //  Functions that is executed in a loop after the setup function (in setup mode)
 void loop() {
-        if (!defaultMode) {
+        if (setupMode) {
                 runServer();
         }
 }
@@ -367,7 +370,7 @@ void setup_wifi() {
         Serial.println(SSID);
 
         WiFi.mode(WIFI_STA);
-        WiFi.begin(SSID, SSID_password);
+        WiFi.begin(SSID, SSID_password, ACCESS_POINT_CHANNEL);
 
         uint8_t count = 0;
 
@@ -450,46 +453,7 @@ void runServer() {
                 wifiClient.println("HTTP/1.1 200 OK");
                 wifiClient.println("Content-Type: text/html");
                 wifiClient.println("");
-                wifiClient.println(
-                        "<!DOCTYPE html><html><head> <title>Tare</title> <style>body { "
-                        "background: #003056; font-family: Helvetica, Arial, sans-serif; "
-                        "color: #2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; "
-                        "border-bottom: 120px solid #e49436; border-left: 208px solid "
-                        "transparent; border-right: 208px solid transparent; position: "
-                        "absolute; top: -120px}.hexagon { width: 416px; height: 240px; "
-                        "margin-top: 124px; margin-left: 3px; background-color: #e49436; "
-                        "position: relative; float: left}.hexagon:after { content: ''; width: "
-                        "0; position: absolute; bottom: -120px; border-top: 120px solid "
-                        "#e49436; border-left: 208px solid transparent; border-right: 208px "
-                        "solid transparent}.hexagon-row { clear: left}.hexagon-row.even { "
-                        "margin-left: 209px}.hexagonIn { width: 370px; text-align: center; "
-                        "position: absolute; top: 50%; left: 50%; transform: translate(-50%, "
-                        "-50%)}.input { color: #3c3c3c; font-family: Helvetica, Arial, "
-                        "sans-serif; font-weight: 500; font-size: 18px; border-radius: 4px; "
-                        "line-height: 22px; background-color: #E1E1E1; padding: 5px 5px 5px "
-                        "5px; margin-bottom: 5px; width: 100%; box-sizing: border-box; border: "
-                        "3px solid #E1E1E1}.input:focus { background: #E1E1E1; box-shadow: 0; "
-                        "border: 3px solid #003056; color: #003056; outline: none; padding: "
-                        "5px 5px 5px 5px;}#button { font-family: Helvetica, sans-serif; float: "
-                        "left; width: 100%; cursor: pointer; background-color: #E1E1E1; color: "
-                        "#003056; border: #003056 solid 3px; font-size: 24px; padding-top: "
-                        "22px; padding-bottom: 22px; transition: all 0.3s; margin-top: 0px; "
-                        "border-radius: 4px}#button:hover { background-color: #003056; color: "
-                        "#E1E1E1; border: #E1E1E1 solid 3px}</style></head><body> <form "
-                        "id='tareForm' action='/tareset'> <div class='hexagon-row'> <div "
-                        "class='hexagon'> <div class='hexagonIn'> <h1> <b>Tare cell "
-                        "1</b><br><b>" +
-                        String(tareArray[0]) + " kg</b> <br><br> <b>Tare cell 2</b><br><b>" +
-                        String(tareArray[1]) + " kg</b> </h1> </div> </div> <div "
-                        "class='hexagon'> <div class='hexagonIn'> <h1> "
-                        "<b>Tare cell 3</b><br><b>" +
-                        String(tareArray[2]) + " kg</b> <br><br> <b>Tare cell 4</b><br><b>" +
-                        String(tareArray[3]) + " kg</b> </h1> </div> </div> </div> <div" +
-                        "class='hexagon-row even'> "
-                        "<div class='hexagon'> <div class='hexagonIn'> <input type='submit' "
-                        "id='button' value='Set New Tare'> </div> </div> </div> "
-                        "</form></body></html>");
-
+                wifiClient.println("<!DOCTYPE html><html><head> <title>Tare</title> <style>body { background: #003056; font-family: Helvetica, Arial, sans-serif; color: #2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; border-bottom: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent; position: absolute; top: -120px}.hexagon { width: 416px; height: 240px; margin-top: 124px; margin-left: 3px; background-color: #e49436; position: relative; float: left}.hexagon:after { content: ''; width: 0; position: absolute; bottom: -120px; border-top: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent}.hexagon-row { clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { width: 370px; text-align: center; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%)}.input { color: #3c3c3c; font-family: Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; border-radius: 4px; line-height: 22px; background-color: #E1E1E1; padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; box-sizing: border-box; border: 3px solid #E1E1E1}.input:focus { background: #E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; outline: none; padding: 5px 5px 5px 5px;}#button { font-family: Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid 3px}</style></head><body> <form id='tareForm' action='/tareset'> <div class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> <h1> <b>Tare cell 1:</b><br><b>"+ String((float(tareArray[0]-zeroArray[0]))/CALIBRATION_FRACT) +" kg</b> <br><br> <b>Tare cell 2:</b><br><b>"+ String((float(tareArray[1]-zeroArray[1]))/CALIBRATION_FRACT) +" kg</b> </h1> </div> </div> <div class='hexagon'> <div class='hexagonIn'> <h1> <b>Tare cell 3:</b><br><b>"+ String((float(tareArray[2]-zeroArray[2]))/CALIBRATION_FRACT) +" kg</b> <br><br> <b>Tare cell 4:</b><br><b>"+ String((float(tareArray[3]-zeroArray[3]))/CALIBRATION_FRACT) +" kg</b> </h1> </div> </div> </div> <div class='hexagon-row even'> <div class='hexagon'> <div class='hexagonIn'> <h1><b>Tare cell 5:</b><br><b> " + "boh " +"kg</b></h1> <input type='submit' id='button' value='Set New Tare'> </div> </div> </div> </form></body></html>");
                 delay(1);
         }
 
@@ -507,64 +471,7 @@ void runServer() {
                 wifiClient.println("HTTP/1.1 200 OK");
                 wifiClient.println("Content-Type: text/html");
                 wifiClient.println("");
-                wifiClient.println(
-                        "<!DOCTYPE html><html><head> <title>Save The Bees</title> <style>body "
-                        "{ "
-                        "background: #003056; font-family: Helvetica, Arial, sans-serif; "
-                        "color: "
-                        "#2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; "
-                        "border-bottom: 120px solid #e49436; border-left: 208px solid "
-                        "transparent; border-right: 208px solid transparent; position: "
-                        "absolute; "
-                        "top: -120px}.hexagon { width: 416px; height: 280px; margin-top: "
-                        "124px; "
-                        "margin-left: 3px; background-color: #e49436; position: relative; "
-                        "float: "
-                        "left}.hexagon:after { content: ''; width: 0; position: absolute; "
-                        "bottom: -120px; border-top: 120px solid #e49436; border-left: 208px "
-                        "solid transparent; border-right: 208px solid transparent}.hexagon-row "
-                        "{ "
-                        "clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { "
-                        "width: "
-                        "370px; text-align: center; position: absolute; top: 50%; left: 50%; "
-                        "transform: translate(-50%, -50%)}.input { color: #3c3c3c; "
-                        "font-family: "
-                        "Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; "
-                        "border-radius: 4px; line-height: 22px; background-color: #E1E1E1; "
-                        "padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; "
-                        "box-sizing: "
-                        "border-box; border: 3px solid #E1E1E1}.input:focus { background: "
-                        "#E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; "
-                        "outline: none; padding: 5px 5px 5px 5px;}#button { font-family: "
-                        "Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; "
-                        "background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; "
-                        "font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: "
-                        "all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { "
-                        "background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid "
-                        "3px}</style></head><body> <form id='credentialsForm' action=''> <div "
-                        "class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> "
-                        "<h1>Wifi Credentials</h1> <b>Wifi SSID:</b> <br> <input type='text' "
-                        "class='input' name='SSID' placeholder='SSID name' value='" +
-                        String(SSID) + "'> <br><br> <b>Wifi Password:</b> <br> <input "
-                        "type='password' class='input' name='SSID_password' "
-                        "placeholder='SSID password value='" +
-                        String(SSID_password) +
-                        "'> </div> </div> <div class='hexagon'> <div class='hexagonIn'> "
-                        "<h1>relayr Credentials</h1> <b>DeviceID:</b> <br> <input type='text' "
-                        "class='input' name='device_ID' "
-                        "placeholder='12345678-1234-1234-1234-0123456789ab' value='" +
-                        String(device_ID) +
-                        "'> <br><br> <b>MQTT Password:</b> <br> <input "
-                        "type='password' class='input' name='MQTT_password' "
-                        "placeholder='ABc1D23efg-h' value='" +
-                        String(MQTT_password) +
-                        "'> <br><br> <b>MQTT Client ID:</b> <br> <input "
-                        "type='text' class='input' name='MQTT_clientID' "
-                        "placeholder='TH6gI6HKjhjkhvfcFDNWw' value='" +
-                        String(MQTT_clientID) +
-                        "'> </div> </div> </div> <div class='hexagon-row even'> <div "
-                        "class='hexagon'> <div class='hexagonIn'> <input type='submit' "
-                        "id='button' value='Save'> </div> </div> </div> </form></body></html>");
+                wifiClient.println("<!DOCTYPE html><html><head> <title>Save The Bees</title> <style>body { background: #003056; font-family: Helvetica, Arial, sans-serif; color: #2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; border-bottom: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent; position: absolute; top: -120px}.hexagon { width: 416px; height: 280px; margin-top: 124px; margin-left: 3px; background-color: #e49436; position: relative; float: left}.hexagon:after { content: ''; width: 0; position: absolute; bottom: -120px; border-top: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent}.hexagon-row { clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { width: 370px; text-align: center; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%)}.input { color: #3c3c3c; font-family: Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; border-radius: 4px; line-height: 22px; background-color: #E1E1E1; padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; box-sizing: border-box; border: 3px solid #E1E1E1}.input:focus { background: #E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; outline: none; padding: 5px 5px 5px 5px;}#button { font-family: Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid 3px}</style></head><body> <form id='credentialsForm' action=''> <div class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> <h1>Wifi Credentials</h1> <b>Wifi SSID:</b> <br> <input type='text' class='input' name='SSID' placeholder='SSID name' value='" + String(SSID) + "'> <br><br> <b>Wifi Password:</b> <br> <input type='password' class='input' name='SSID_password' placeholder='SSID password' value='" + String(SSID_password) + "'> </div> </div> <div class='hexagon'> <div class='hexagonIn'> <h1>relayr Credentials</h1> <b>DeviceID:</b> <br> <input type='text' class='input' name='device_ID' placeholder='12345678-1234-1234-1234-0123456789ab' value='" +String(device_ID) + "'> <br><br> <b>MQTT Password:</b> <br> <input type='password' class='input' name='MQTT_password' placeholder='ABc1D23efg-h' value='" + String(MQTT_password) + "'> <br><br> <b>MQTT Client ID:</b> <br> <input type='password' class='input' name='MQTT_clientID' placeholder='TH6gI6HKjhjkhvfcFDNWw' value='" + String(MQTT_clientID) + "'> </div> </div> </div> <div class='hexagon-row even'> <div class='hexagon'> <div class='hexagonIn'> <input type='submit' id='button' value='Save'> </div> </div> </div> </form></body></html>");
                 delay(1);
         }
 }
@@ -633,7 +540,9 @@ void parseClientRequest(String req) {
         startIndex = req.indexOf("GET /tareset");
         if (startIndex != -1) {
                 tareMode = true;
+                EEPROM.begin(FLASH_SIZE);
                 setTare();
+                EEPROM.end();
         }
 
         startIndex = req.indexOf("GET /tare");
@@ -901,9 +810,9 @@ void loadSensors() {
                 //  Multiply the value for 100 in order to use just 2 bytes to store
                 //  into the EEPROM
                 humidity = humidity_tmp * 100.00;
-                Serial.print("debug humidity: ");
+                Serial.print("Debug Humidity: ");
                 Serial.println(humidity_tmp);
-                Serial.print("humidity: ");
+                Serial.print("Humidity: ");
                 Serial.println(humidity);
 
                 if (isnan(humidity_tmp) || (humidity == -1))
@@ -922,9 +831,9 @@ void loadSensors() {
                 //  Multiply the value for 100 in order to use just 2 bytes to store
                 //  into the EEPROM
                 temperature = temperature_tmp * 100.00;
-                Serial.print("debug temperature: ");
+                Serial.print("Debug Temperature: ");
                 Serial.println(temperature_tmp);
-                Serial.print("temperature: ");
+                Serial.print("Temperature: ");
                 Serial.println(temperature);
 
                 if (isnan(temperature_tmp) || (temperature == -1))
@@ -941,26 +850,72 @@ void loadLoadcells() {
 
         float sum = 0;
 
-        //  Check if the tare is selected
-        if (digitalRead(TAREPIN))
-                setTare();
+        //  Read all the load cells by switching through the ADC
+        for (uint8_t i = 1; i < 6; i++) {
 
-        //  Read all the load cells by switching through the multiplexer
-        for (uint8_t i = 0; i < 4; i++) {
-                digitalWrite(S0, bitRead(i, 0));
-                digitalWrite(S1, bitRead(i, 1));
+                uint16_t tmp_reading = 0;
+
+                for (uint8_t k = 0; k < 5; k++)
+                {
+                        tmp_reading += read_adc(i);
+                }
+
+                tmp_reading = tmp_reading/5;
 
                 //  Read the analog input from the multiplexer
-                loadArray[i] = analogRead(LOADPIN);
+                loadArray[i-1] = tmp_reading;
 
                 //  Save into sum the calibrated value of each load cell
-                sum += calibrate((loadArray[i] - tareArray[i]));
+                sum += calibrate((loadArray[i-1] - tareArray[i-1]));
         }
 
         weight_tmp = sum;
         weight = weight_tmp * 100;
-        Serial.println("debug weight: " + String(weight_tmp) + " kg");
-        Serial.println("debug weight: " + String(weight));
+        Serial.println("Debug Weight: " + String(weight_tmp) + " kg");
+        Serial.println("Debug Weight: " + String(weight));
+}
+
+
+
+//  Read ADC function
+int read_adc(int channel){
+        int adcvalue = 0;
+
+        //  Command bits from left: START (1), SINGLE MODE (1), 3x CHANNEL SELECTION(000), 3x DONT CARE (000)
+        byte commandbits = B11000000;
+
+        //  Insert channel into command bits
+        commandbits|=((channel-1)<<3);
+
+        //  Select ADC on SPI
+        digitalWrite(SELPIN,LOW);
+
+        //  Send setup bits to ADC
+        for (int i=7; i>=3; i--) {
+                digitalWrite(DATAOUT,commandbits&1<<i);
+
+                digitalWrite(SPICLOCK,HIGH);
+                digitalWrite(SPICLOCK,LOW);
+        }
+
+        //  Two clock time to start output
+        digitalWrite(SPICLOCK,HIGH);
+        digitalWrite(SPICLOCK,LOW);
+        digitalWrite(SPICLOCK,HIGH);
+        digitalWrite(SPICLOCK,LOW);
+
+        //  Read from ADC
+        for (int i=11; i>=0; i--) {
+                adcvalue+=digitalRead(DATAIN)<<i;
+
+                digitalWrite(SPICLOCK,HIGH);
+                digitalWrite(SPICLOCK,LOW);
+        }
+
+        //  Deselect ADC from SPI
+        digitalWrite(SELPIN, HIGH);
+
+        return adcvalue;
 }
 
 
@@ -968,18 +923,29 @@ void loadLoadcells() {
 //  Set the tare value for each loadcell
 void setTare() {
 
-        //  Read the tare value from multiplexer
-        for (uint8_t i = 0; i < 4; i++) {
-                digitalWrite(S0, bitRead(i, 0));
-                digitalWrite(S1, bitRead(i, 1));
-                tareArray[i] = analogRead(LOADPIN);
+        //  Read all the load cells by switching through the ADC
+        for (uint8_t i = 1; i < 6; i++) {
+
+                uint16_t tmp_reading = 0;
+
+                for (uint8_t k = 0; k < 5; k++)
+                {
+                        tmp_reading += read_adc(i);
+                }
+
+                tmp_reading = tmp_reading/5;
+
+                //  Read the analog input from the multiplexer
+                tareArray[i-1] = tmp_reading;
         }
 
         //  Save the tare values
         EEPROM.put(TARE_BYTE, tareArray);
+
+
         Serial.println("Setting TARE to: " + String(tareArray[0]) + " " +
                        String(tareArray[1]) + " " + String(tareArray[2]) + " " +
-                       String(tareArray[3]));
+                       String(tareArray[3]) + " " + String(tareArray[4]));
 }
 
 
