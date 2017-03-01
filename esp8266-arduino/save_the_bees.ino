@@ -1,5 +1,5 @@
 /*
- *   Save The Bees 1.1.2
+ *   Save The Bees 1.1.3
  *
  *   This Arduino sketch is developed for the Wemos D1 mini board but should
  *   work on every ESP8266 based board with few modifications.
@@ -16,7 +16,7 @@
  *                   relayr cloud and send all of them. Then the cycle of readings
  *                   starts again.
  *
- *   Last Edit: 13 Jan 2016 20.52 CET
+ *   Last Edit: 27 Feb 2016 16.00 CET
  *
  *   Copyright Riccardo Marconcini (riccardo DOT marconcini AT relayr DOT de)
  *
@@ -38,6 +38,10 @@
 #include <RTClib.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SFE_MicroOLED.h>
 
 
 
@@ -46,7 +50,7 @@
 ***************************************************************************************/
 
 // Software version
-#define stb "1.1.2"
+#define stb "1.1.3"
 
 //  MQTT Params
 #define MQTT_SERVER "mqtt.relayr.io"
@@ -85,6 +89,7 @@
 
 //  Pin to change Operating Mode
 #define MODEPIN A0
+#define THREESTATEPIN D3
 
 //  Wifi Credentials of Setup Mode
 #define WEB_SERVER_PORT 80
@@ -102,6 +107,11 @@
 //  Calibration fract
 #define CALIBRATION_FRACT 68
 
+// Screen Init
+#define OLED_RESET 0
+#define PIN_RESET 255
+#define DC_JUMPER 0  // I2C Addres: 0 - 0x3C, 1 - 0x3D
+
 
 
 /***************************************************************************************
@@ -113,6 +123,7 @@ WiFiClient espClient;
 PubSubClient pubSubClient(espClient);
 RTC_DS3231 rtc; //  or RTC_DS1307
 Adafruit_AM2315 am2315;
+MicroOLED oled(PIN_RESET, DC_JUMPER);
 WiFiUDP udp;
 uint16_t lastPublishTime;
 uint16_t publishingPeriod = 3000;
@@ -121,6 +132,7 @@ uint16_t tareArray[5];
 uint16_t zeroArray[] {411, 403, 414, 465, 400};
 uint16_t humidity, temperature, weight;
 uint16_t currentCycle;
+uint16_t bulkDim = BULK_DIM;
 u_long currentRTCCycle;
 u_long unixTime;
 float humidity_tmp, temperature_tmp, weight_tmp;
@@ -162,7 +174,17 @@ void setup() {
         pinMode(DATAIN, INPUT);
         pinMode(SPICLOCK, OUTPUT);
         pinMode(MODEPIN, INPUT);
+        pinMode(THREESTATEPIN, OUTPUT);
 
+        //  Force the WiFi off to avoid troubles with wifi after woke up from deep
+        //  sleep with a I2C device connected
+        WiFi.mode(WIFI_OFF);
+
+        //  Activate the three-state buffer
+        digitalWrite(THREESTATEPIN, LOW);
+        delay(1000);
+
+        //  Set up the SPI connection for the ADC
         digitalWrite(SELPIN,HIGH);
         digitalWrite(DATAOUT,LOW);
         digitalWrite(SPICLOCK,LOW);
@@ -175,10 +197,10 @@ void setup() {
         Serial.println("\n\n");
         Serial.println("*** Save The Bees " + String(stb) + " ***");
 
-        EEPROM.get(TARE_BYTE, tareArray);
-        Serial.println("TARE: " + String(tareArray[0]) + " " +
-                       String(tareArray[1]) + " " + String(tareArray[2]) + " " +
-                       String(tareArray[3]) + " " + String(tareArray[4]));
+        //  Initialize the screen
+        oled.begin();
+        oled.clear(ALL);
+        oled.display();
 
         // Check in which mode is the board
         if (analogRead(MODEPIN) > 600)
@@ -186,8 +208,30 @@ void setup() {
         else
                 setupMode = false;
 
+        if (rtc.lostPower()) {
+                Serial.println("RTC lost power, setting NTP");
+                setup_wifi();
+
+                u_long NTPtime = 0;
+
+                while (true) {
+                        delay(2000);
+                        NTPtime = ntpUnixTime(udp);
+                        Serial.print("NTP Time: ");
+                        Serial.println(NTPtime);
+                        if (NTPtime != 0)
+                                break;
+                }
+
+                //  Adjust RTC Module
+                rtc.adjust(DateTime(NTPtime));
+                Serial.println("RTC time just adusted with NTP time");
+        }
+
         if (setupMode) {
                 Serial.println("Setup mode active");
+                oled.println("Setup Mode");
+                oled.display();
                 setupServer();
                 EEPROM.end();
 
@@ -198,22 +242,30 @@ void setup() {
                 while (true) {
                         if (!rtc.begin()) {
                                 Serial.println("RTC module not found... Retrying");
+                                oled.clear(ALL);
+                                oled.println("RTC ERROR");
+                                oled.display();
                         } else
                                 break;
                 }
+
+                delay(2000);
 
                 while (true) {
                         if (!am2315.begin()) {
                                 Serial.println("AM2315 module not found... Retrying");
+                                oled.clear(ALL);
+                                oled.println("HUM-TEMP");
+                                oled.println("ERROR");
+                                oled.display();
+                                delay(3000);
                         } else
                                 break;
                 }
 
-                Serial.println("Modules initialized");
+                delay(2000);
 
-                //  Force the WiFi off to avoid troubles with wifi after woke up from deep
-                //  sleep with a I2C device connected
-                WiFi.mode(WIFI_OFF);
+                Serial.println("Modules initialized");
 
                 //  Read the cycle counters from EEPROM
                 currentCycle = EEPROMReadInt(PACKET_CYCLE_BYTE);
@@ -221,14 +273,22 @@ void setup() {
 
                 //  Read the tare from EEPROM
                 EEPROM.get(TARE_BYTE, tareArray);
+                /*Serial.println("TARE: " + String(tareArray[0]) + " " +
+                               String(tareArray[1]) + " " + String(tareArray[2]) + " " +
+                               String(tareArray[3]) + " " + String(tareArray[4]));*/
 
-                //  In case of flashing a sketch with reduced BULK DIM than the previous
-                //  flashed version, set counter to zero
+                //  In case the last publishing was interrupted for getting new readings,
+                //  the counter must be set to zero
                 if (currentCycle > BULK_DIM) {
                         currentCycle = 0;
                 }
 
                 if (currentCycle < BULK_DIM) {
+
+                        oled.clear(ALL);
+                        oled.setCursor(0, 0);
+                        oled.println("PKT: "+String(currentCycle+1)+"/"+BULK_DIM);
+                        oled.display();
 
                         Serial.print("Packet number: ");
                         Serial.print(currentCycle + 1);
@@ -243,6 +303,7 @@ void setup() {
                         if (currentRTCCycle >= RTC_CYCLE)
                                 Serial.println(
                                         "The RTC time will be adjusted during next internet connection");
+                        delay(2000);
 
                         //  Get readings from sensors
                         loadSensors();
@@ -258,6 +319,21 @@ void setup() {
                         EEPROMWriteInt(TEMP_BYTE + (currentCycle * PACKET_SIZE), temperature);
                         EEPROMWriteInt(HUM_BYTE + (currentCycle * PACKET_SIZE), humidity);
                         EEPROMWriteInt(WEIGHT_BYTE + (currentCycle * PACKET_SIZE), weight);
+
+                        delay(2000);
+
+
+                        oled.print(float(temperature)/100);
+                        oled.println(" C");
+                        oled.print(float(humidity)/100);
+                        oled.println(" %");
+                        oled.print(float(weight)/100);
+                        oled.println(" Kg");
+                        oled.print(rtc.now().hour(),DEC);
+                        oled.print(":");
+                        oled.print(rtc.now().minute(),DEC);
+                        oled.display();
+                        delay(2000);
 
                         Serial.println("Data saved into the EEPROM");
 
@@ -276,6 +352,11 @@ void setup() {
                         //  If the packet just saved is the last one, send all the data in bulk
                         else {
 
+                                oled.clear(ALL);
+                                oled.setCursor(0, 0);
+                                oled.println("Connecting");
+                                oled.display();
+
                                 //  Read WiFi credentials from EEPROM
                                 EEPROM.get(SSID_BYTE, SSID);
                                 EEPROM.get(SSID_PWD_BYTE, SSID_password);
@@ -283,8 +364,12 @@ void setup() {
                                 //  Initializing WiFi
                                 setup_wifi();
 
+                                oled.println("Connected");
+                                oled.display();
+
                                 //  Check if the RTC should be adjusted
                                 if (currentRTCCycle >= RTC_CYCLE) {
+
                                         delay(500);
 
                                         u_long NTPtime = 0;
@@ -303,6 +388,7 @@ void setup() {
                                         Serial.println("RTC time just adusted with NTP time");
 
                                         //  Clear RTC counter
+                                        currentRTCCycle = 0;
                                         EEPROMWriteLong(RTC_CYCLE_BYTE, 0);
                                 }
 
@@ -318,8 +404,40 @@ void setup() {
                                                    : MIN_PUBLISH_PERIOD;
                                 mqtt_connect();
 
+                                oled.clear(ALL);
+                                oled.setCursor(0, 0);
+                                oled.println("Publishing");
+                                oled.display();
+
                                 //  Cycle that publishes all the packets stored into the EEPROM
-                                for (uint16_t i = 0; i < BULK_DIM; i++) {
+                                for (uint16_t i = 0; i < bulkDim; i++) {
+
+                                        if (rtc.now().unixtime() > (unixTime + SLEEP_TIME))
+                                        {
+                                                Serial.println("Interrupt the publishing because it is time to acquire new data");
+
+                                                //  Get readings from sensors
+                                                loadSensors();
+                                                loadLoadcells();
+
+                                                //  Get the timestamp from RTC module
+                                                unixTime = rtc.now().unixtime();
+                                                Serial.print("RTC time: ");
+                                                Serial.println(unixTime);
+
+                                                //  Save the readings and the timestamp into the EEPROM
+                                                EEPROMWriteLong(TIMESTAMP_BYTE + (currentCycle * PACKET_SIZE), unixTime);
+                                                EEPROMWriteInt(TEMP_BYTE + (currentCycle * PACKET_SIZE), temperature);
+                                                EEPROMWriteInt(HUM_BYTE + (currentCycle * PACKET_SIZE), humidity);
+                                                EEPROMWriteInt(WEIGHT_BYTE + (currentCycle * PACKET_SIZE), weight);
+
+                                                Serial.println("Data saved into the EEPROM");
+                                                currentCycle++;
+                                                currentRTCCycle++;
+
+                                                bulkDim++;
+                                        }
+
                                         publish_packet(i);
                                         delay(500);
                                 }
@@ -327,6 +445,7 @@ void setup() {
                                 //  After sent all packets, the packet counter is set to 0
                                 Serial.println("Clearing EEPROM");
                                 EEPROMWriteInt(PACKET_CYCLE_BYTE, 0);
+                                EEPROMWriteLong(RTC_CYCLE_BYTE, currentRTCCycle);
                                 EEPROM.end();
                         }
 
@@ -335,6 +454,8 @@ void setup() {
                         //  Yield function to give time to finish executing all background
                         //  processes
                         yield();
+
+                        digitalWrite(THREESTATEPIN, HIGH);
 
                         //  Setting the deep sleep time
                         ESP.deepSleep(SLEEP_TIME * 1000000);
@@ -453,7 +574,17 @@ void runServer() {
                 wifiClient.println("HTTP/1.1 200 OK");
                 wifiClient.println("Content-Type: text/html");
                 wifiClient.println("");
-                wifiClient.println("<!DOCTYPE html><html><head> <title>Tare</title> <style>body { background: #003056; font-family: Helvetica, Arial, sans-serif; color: #2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; border-bottom: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent; position: absolute; top: -120px}.hexagon { width: 416px; height: 240px; margin-top: 124px; margin-left: 3px; background-color: #e49436; position: relative; float: left}.hexagon:after { content: ''; width: 0; position: absolute; bottom: -120px; border-top: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent}.hexagon-row { clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { width: 370px; text-align: center; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%)}.input { color: #3c3c3c; font-family: Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; border-radius: 4px; line-height: 22px; background-color: #E1E1E1; padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; box-sizing: border-box; border: 3px solid #E1E1E1}.input:focus { background: #E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; outline: none; padding: 5px 5px 5px 5px;}#button { font-family: Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid 3px}</style></head><body> <form id='tareForm' action='/tareset'> <div class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> <h1> <b>Tare cell 1:</b><br><b>"+ String((float(tareArray[0]-zeroArray[0]))/CALIBRATION_FRACT) +" kg</b> <br><br> <b>Tare cell 2:</b><br><b>"+ String((float(tareArray[1]-zeroArray[1]))/CALIBRATION_FRACT) +" kg</b> </h1> </div> </div> <div class='hexagon'> <div class='hexagonIn'> <h1> <b>Tare cell 3:</b><br><b>"+ String((float(tareArray[2]-zeroArray[2]))/CALIBRATION_FRACT) +" kg</b> <br><br> <b>Tare cell 4:</b><br><b>"+ String((float(tareArray[3]-zeroArray[3]))/CALIBRATION_FRACT) +" kg</b> </h1> </div> </div> </div> <div class='hexagon-row even'> <div class='hexagon'> <div class='hexagonIn'> <h1><b>Tare cell 5:</b><br><b> " + "boh " +"kg</b></h1> <input type='submit' id='button' value='Set New Tare'> </div> </div> </div> </form></body></html>");
+                wifiClient.println("<!DOCTYPE html><html><head> <title>Tare</title> <style>body { background: #003056; font-family: Helvetica, Arial, sans-serif; color: #2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; border-bottom: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent; position: absolute; top: -120px}.hexagon { width: 416px; height: 240px; margin-top: 124px; margin-left: 3px; background-color: #e49436; position: relative; float: left}.hexagon:after { content: ''; width: 0; position: absolute; bottom: -120px; border-top: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent}.hexagon-row { clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { width: 370px; text-align: center; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%)}.input { color: #3c3c3c; font-family: Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; border-radius: 4px; line-height: 22px; background-color: #E1E1E1; padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; box-sizing: border-box; border: 3px solid #E1E1E1}.input:focus { background: #E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; outline: none; padding: 5px 5px 5px 5px;}#button { font-family: Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid 3px}</style></head><body> <form id='tareForm' action='/tareset'> <div class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> <h1> <b>Tare cell 1:</b><br><b>"+
+                                   String((float(tareArray[0]-zeroArray[0]))/CALIBRATION_FRACT) +
+                                   " kg</b> <br><br> <b>Tare cell 2:</b><br><b>"+
+                                   String((float(tareArray[1]-zeroArray[1]))/CALIBRATION_FRACT) +
+                                   " kg</b> </h1> </div> </div> <div class='hexagon'> <div class='hexagonIn'> <h1> <b>Tare cell 3:</b><br><b>"+
+                                   String((float(tareArray[2]-zeroArray[2]))/CALIBRATION_FRACT) +
+                                   " kg</b> <br><br> <b>Tare cell 4:</b><br><b>"+
+                                   String((float(tareArray[3]-zeroArray[3]))/CALIBRATION_FRACT) +
+                                   " kg</b> </h1> </div> </div> </div> <div class='hexagon-row even'> <div class='hexagon'> <div class='hexagonIn'> <h1><b>Tare cell 5:</b><br><b> " +
+                                   String((float(tareArray[4]-zeroArray[4]))/CALIBRATION_FRACT) +
+                                   "kg</b></h1> <input type='submit' id='button' value='Set New Tare'> </div> </div> </div> </form></body></html>");
                 delay(1);
         }
 
@@ -471,7 +602,13 @@ void runServer() {
                 wifiClient.println("HTTP/1.1 200 OK");
                 wifiClient.println("Content-Type: text/html");
                 wifiClient.println("");
-                wifiClient.println("<!DOCTYPE html><html><head> <title>Save The Bees</title> <style>body { background: #003056; font-family: Helvetica, Arial, sans-serif; color: #2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; border-bottom: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent; position: absolute; top: -120px}.hexagon { width: 416px; height: 280px; margin-top: 124px; margin-left: 3px; background-color: #e49436; position: relative; float: left}.hexagon:after { content: ''; width: 0; position: absolute; bottom: -120px; border-top: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent}.hexagon-row { clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { width: 370px; text-align: center; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%)}.input { color: #3c3c3c; font-family: Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; border-radius: 4px; line-height: 22px; background-color: #E1E1E1; padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; box-sizing: border-box; border: 3px solid #E1E1E1}.input:focus { background: #E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; outline: none; padding: 5px 5px 5px 5px;}#button { font-family: Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid 3px}</style></head><body> <form id='credentialsForm' action=''> <div class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> <h1>Wifi Credentials</h1> <b>Wifi SSID:</b> <br> <input type='text' class='input' name='SSID' placeholder='SSID name' value='" + String(SSID) + "'> <br><br> <b>Wifi Password:</b> <br> <input type='password' class='input' name='SSID_password' placeholder='SSID password' value='" + String(SSID_password) + "'> </div> </div> <div class='hexagon'> <div class='hexagonIn'> <h1>relayr Credentials</h1> <b>DeviceID:</b> <br> <input type='text' class='input' name='device_ID' placeholder='12345678-1234-1234-1234-0123456789ab' value='" +String(device_ID) + "'> <br><br> <b>MQTT Password:</b> <br> <input type='password' class='input' name='MQTT_password' placeholder='ABc1D23efg-h' value='" + String(MQTT_password) + "'> <br><br> <b>MQTT Client ID:</b> <br> <input type='password' class='input' name='MQTT_clientID' placeholder='TH6gI6HKjhjkhvfcFDNWw' value='" + String(MQTT_clientID) + "'> </div> </div> </div> <div class='hexagon-row even'> <div class='hexagon'> <div class='hexagonIn'> <input type='submit' id='button' value='Save'> </div> </div> </div> </form></body></html>");
+                wifiClient.println("<!DOCTYPE html><html><head> <title>Save The Bees</title> <style>body { background: #003056; font-family: Helvetica, Arial, sans-serif; color: #2B2B2B}.hexagon:before { content: ''; width: 0; height: 0; border-bottom: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent; position: absolute; top: -120px}.hexagon { width: 416px; height: 280px; margin-top: 124px; margin-left: 3px; background-color: #e49436; position: relative; float: left}.hexagon:after { content: ''; width: 0; position: absolute; bottom: -120px; border-top: 120px solid #e49436; border-left: 208px solid transparent; border-right: 208px solid transparent}.hexagon-row { clear: left}.hexagon-row.even { margin-left: 209px}.hexagonIn { width: 370px; text-align: center; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%)}.input { color: #3c3c3c; font-family: Helvetica, Arial, sans-serif; font-weight: 500; font-size: 18px; border-radius: 4px; line-height: 22px; background-color: #E1E1E1; padding: 5px 5px 5px 5px; margin-bottom: 5px; width: 100%; box-sizing: border-box; border: 3px solid #E1E1E1}.input:focus { background: #E1E1E1; box-shadow: 0; border: 3px solid #003056; color: #003056; outline: none; padding: 5px 5px 5px 5px;}#button { font-family: Helvetica, sans-serif; float: left; width: 100%; cursor: pointer; background-color: #E1E1E1; color: #003056; border: #003056 solid 3px; font-size: 24px; padding-top: 22px; padding-bottom: 22px; transition: all 0.3s; margin-top: 0px; border-radius: 4px}#button:hover { background-color: #003056; color: #E1E1E1; border: #E1E1E1 solid 3px}</style></head><body> <form id='credentialsForm' action=''> <div class='hexagon-row'> <div class='hexagon'> <div class='hexagonIn'> <h1>Wifi Credentials</h1> <b>Wifi SSID:</b> <br> <input type='text' class='input' name='SSID' placeholder='SSID name' value='" +
+                                   String(SSID) +
+                                   "'> <br><br> <b>Wifi Password:</b> <br> <input type='password' class='input' name='SSID_password' placeholder='SSID password' value='" +
+                                   String(SSID_password) + "'> </div> </div> <div class='hexagon'> <div class='hexagonIn'> <h1>relayr Credentials</h1> <b>DeviceID:</b> <br> <input type='text' class='input' name='device_ID' placeholder='12345678-1234-1234-1234-0123456789ab' value='" +
+                                   String(device_ID) + "'> <br><br> <b>MQTT Password:</b> <br> <input type='password' class='input' name='MQTT_password' placeholder='ABc1D23efg-h' value='" +
+                                   String(MQTT_password) + "'> <br><br> <b>MQTT Client ID:</b> <br> <input type='password' class='input' name='MQTT_clientID' placeholder='TH6gI6HKjhjkhvfcFDNWw' value='" +
+                                   String(MQTT_clientID) + "'> </div> </div> </div> <div class='hexagon-row even'> <div class='hexagon'> <div class='hexagonIn'> <input type='submit' id='button' value='Save'> </div> </div> </div> </form></body></html>");
                 delay(1);
         }
 }
@@ -799,6 +936,8 @@ u_long ntpUnixTime(UDP &udp) {
 //  Load temperature and humidity
 void loadSensors() {
 
+        int8_t cycle = 0;
+
         //  Read the humidity
         while (true) {
 
@@ -810,16 +949,24 @@ void loadSensors() {
                 //  Multiply the value for 100 in order to use just 2 bytes to store
                 //  into the EEPROM
                 humidity = humidity_tmp * 100.00;
-                Serial.print("Debug Humidity: ");
-                Serial.println(humidity_tmp);
+                //Serial.print("Debug Humidity: ");
+                //Serial.println(humidity_tmp);
                 Serial.print("Humidity: ");
-                Serial.println(humidity);
+                Serial.println(humidity_tmp);
 
-                if (isnan(humidity_tmp) || (humidity == -1))
+                if (isnan(humidity_tmp) || (humidity == -1)) {
                         Serial.println("Failed to read from the sensor! Retrying...");
+                        if (cycle > 10) {
+                                //  Setting the deep sleep time
+                                ESP.deepSleep(3 * 1000000);
+                        }
+                        cycle++;
+                }
                 else
                         break;
         }
+
+        cycle = 0;
 
         //  Read the temperature
         while (true) {
@@ -831,13 +978,19 @@ void loadSensors() {
                 //  Multiply the value for 100 in order to use just 2 bytes to store
                 //  into the EEPROM
                 temperature = temperature_tmp * 100.00;
-                Serial.print("Debug Temperature: ");
-                Serial.println(temperature_tmp);
+                //Serial.print("Debug Temperature: ");
+                //Serial.println(temperature_tmp);
                 Serial.print("Temperature: ");
-                Serial.println(temperature);
+                Serial.println(temperature_tmp);
 
-                if (isnan(temperature_tmp) || (temperature == -1))
+                if (isnan(temperature_tmp) || (temperature == -1)) {
                         Serial.println("Failed to read from the sensor! Retrying...");
+                        if (cycle > 10) {
+                                //  Setting the deep sleep time
+                                ESP.deepSleep(3 * 1000000);
+                        }
+                        cycle++;
+                }
                 else
                         break;
         }
@@ -871,8 +1024,8 @@ void loadLoadcells() {
 
         weight_tmp = sum;
         weight = weight_tmp * 100;
-        Serial.println("Debug Weight: " + String(weight_tmp) + " kg");
-        Serial.println("Debug Weight: " + String(weight));
+        Serial.println("Weight: " + String(weight_tmp) + " kg");
+        //Serial.println("Debug Weight: " + String(weight));
 }
 
 
